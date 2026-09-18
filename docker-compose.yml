@@ -1,0 +1,37 @@
+services:
+  verdaccio:
+    # Exact pin: the security policy must not change due to a floating tag.
+    # The @verdaccio/package-filter plugin is bundled since 6.4.0.
+    image: verdaccio/verdaccio:6.9.2
+    container_name: verdaccio-minage-proxy
+    restart: unless-stopped
+    ports:
+      # Expose only where the repo manager can reach it. TLS is terminated by
+      # the platform LB in front of this port (plain HTTP up to the LB is
+      # accepted).
+      - "4873:4873"
+    volumes:
+      # Policy and credentials live in git and are deployed IDENTICALLY to
+      # each cluster/instance (HA: 2 instances in 2 clusters, see README).
+      - ./conf/config.yaml:/verdaccio/conf/config.yaml:ro
+      - ./conf/htpasswd:/verdaccio/conf/htpasswd:ro
+      # Disposable cache PER INSTANCE — do not share between instances
+      # (verdaccio storage does not support multi-instance concurrent access;
+      # also, each instance can cache independently from npmjs).
+      - verdaccio-storage:/verdaccio/storage
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:4873/-/ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # The healthcheck feeds the LB: during a rolling restart (e.g. when
+      # applying an allow rule) the restarting instance drops out of the pool.
+      start_period: 5s
+    # Lean resources: this proxy only serves metadata/tarballs to the repo manager.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+volumes:
+  verdaccio-storage:

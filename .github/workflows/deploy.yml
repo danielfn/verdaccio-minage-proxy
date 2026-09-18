@@ -1,0 +1,265 @@
+# Production deploy: validate → apply cluster A → apply cluster B → smoke.
+#
+# Trigger: push to main touching conf/** or deploy/**, or manual (Actions →
+# deploy → Run workflow — also the path to take after rotating credentials:
+# update the repo secret HTPASSWD_B64 and re-run).
+#
+# WHY THE A → B SERIES (never concurrent): if A's rollout does not converge
+# (broken image, invalid runtime config), B is NOT touched and the LB keeps
+# serving traffic with the OLD policy from B — the blast radius of a bad
+# deploy is half the fleet, not all of it. B only gets apply when A's
+# `kubectl rollout status` has been green (needs: deploy-a).
+#
+# WHY THE CHECKSUM PATCH: pods do NOT restart on their own when a
+# subPath-mounted ConfigMap/Secret changes (K8s updates the volume, not the
+# container's subPath). kustomize's configMapGenerator already changes the
+# pod template when conf/config.yaml changes (hash in the ConfigMap name);
+# this patch is belt-and-suspenders AND covers the htpasswd Secret
+# ROTATION: the checksum is computed over config.yaml + HTPASSWD_B64,
+# so rotating credentials also changes the annotation → rolling → the new
+# pods mount the fresh Secret (verdaccio hot-reloads htpasswd, but with
+# subPath the old pod's file does not even change).
+#
+# Rollback (also in docs/break-glass.md), on the affected cluster:
+#   kubectl rollout undo deployment/vmp-a-verdaccio   # (or vmp-b-)
+#
+# Repo config (details in README "Operations" → "CI/CD (deploy)"):
+#   secrets   KUBE_CONFIG_CLUSTER_A / KUBE_CONFIG_CLUSTER_B — CI kubeconfig
+#             (minimal service account; the namespace of its context determines
+#             the namespace of EVERYTHING this pipeline applies)
+#             HTPASSWD_B64 — base64 -w0 of the FULL conf/htpasswd
+#             SERVICE_USER / SERVICE_PASS — service account (smoke)
+#   variable  LB_URL — LB endpoint (same value as the canary's REGISTRY_URL)
+#
+# Kustomize choice: `kubectl kustomize --load-restrictor
+# LoadRestrictionsNone` because the policy lives in conf/, OUTSIDE the
+# overlay root, and without the flag the build fails (see
+# deploy/k8s/base/kustomization.yaml). Verified against kubectl v1.36 (the
+# kubectl on ubuntu-latest runners is modern and supports the flag).
+# NOTE: `kubectl apply -k` does NOT support --load-restrictor → it is
+# rendered with `kubectl kustomize` and applied with `kubectl apply -f -`.
+#
+# Pins: actions pinned by commit SHA with the version in a comment (same
+# criterion as canary.yml).
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "conf/**"
+      - "deploy/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Deploys are ALSO serialized across runs: a run in progress is never
+# half-cancelled by a new push (subsequent ones wait in the queue).
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # yq does not come preinstalled on the runner; installation pinned by
+      # version + sha256 so the policy guardian does not depend on a mutable
+      # binary.
+      - name: Install yq (pinned)
+        run: |
+          yq_version=v4.44.3
+          yq_sha256=a2c097180dd884a8d50c956ee16a9cec070f30a7947cf4ebf87d5f36213e9ed7
+          curl -fsSL -o /tmp/yq \
+            "https://github.com/mikefarah/yq/releases/download/${yq_version}/yq_linux_amd64"
+          echo "${yq_sha256}  /tmp/yq" | sha256sum --strict --check -
+          sudo install -m 0755 /tmp/yq /usr/local/bin/yq
+          yq --version
+
+      - name: Kustomize build of both overlays
+        run: |
+          # Make the overlays render BEFORE touching any cluster (the
+          # config lives in conf/, outside the kustomize root → the
+          # load-restrictor is mandatory or the build fails).
+          for overlay in cluster-a cluster-b; do
+            echo "== kubectl kustomize deploy/k8s/overlays/$overlay"
+            kubectl kustomize --load-restrictor LoadRestrictionsNone \
+              "deploy/k8s/overlays/$overlay" > /dev/null
+          done
+          echo "ok: both overlays render"
+
+      - name: "Policy: minAgeDays integer > 0"
+        run: |
+          # Policy guardian: if someone breaks conf/config.yaml (invalid
+          # YAML → yq fails; minAgeDays missing/string/negative → asserts)
+          # the pipeline stops at validate, before touching any cluster. The
+          # tag check (!!int) tells 4 from "4": a string would break the
+          # filter at runtime.
+          min_age_days="$(yq '.filters."@verdaccio/package-filter".minAgeDays' conf/config.yaml)"
+          if ! yq -e '(.filters."@verdaccio/package-filter".minAgeDays | tag) == "!!int"' conf/config.yaml > /dev/null; then
+            echo "::error::filters.'@verdaccio/package-filter'.minAgeDays must be an integer (got: '${min_age_days:-null}' — string, missing or null?)"
+            exit 1
+          fi
+          if [ "$min_age_days" -le 0 ]; then
+            echo "::error::filters.'@verdaccio/package-filter'.minAgeDays must be > 0 (got: $min_age_days)"
+            exit 1
+          fi
+          echo "ok: minAgeDays=$min_age_days (integer > 0)"
+
+      - name: Shellcheck the scripts
+        run: shellcheck scripts/*.sh
+
+  deploy-a:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Cluster A kubeconfig
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG_CLUSTER_A }}
+        run: |
+          mkdir -p "$HOME/.kube"
+          printf '%s' "$KUBE_CONFIG" > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Materialize Secret verdaccio-htpasswd
+        env:
+          HTPASSWD_B64: ${{ secrets.HTPASSWD_B64 }}
+        run: |
+          # The Secret lives OUTSIDE the kustomization (gets no namePrefix) →
+          # it is materialized with EXACTLY the name verdaccio-htpasswd.
+          # Rotation = update the repo secret and re-run this workflow.
+          htpasswd_file="$(mktemp)"
+          trap 'rm -f "$htpasswd_file"' EXIT
+          printf '%s' "$HTPASSWD_B64" | base64 --decode > "$htpasswd_file"
+          if [ ! -s "$htpasswd_file" ]; then
+            echo "::error::HTPASSWD_B64 is empty or not valid base64"
+            exit 1
+          fi
+          kubectl create secret generic verdaccio-htpasswd \
+            --from-file=htpasswd="$htpasswd_file" \
+            --dry-run=client --output=yaml | kubectl apply --filename=-
+
+      - name: Apply overlay + force rollout + wait for health (cluster A)
+        env:
+          HTPASSWD_B64: ${{ secrets.HTPASSWD_B64 }}
+        run: |
+          # Checksum of EVERYTHING the pods mount via subPath: config.yaml
+          # (ConfigMap) + htpasswd (Secret). Changing either one changes
+          # the annotation → pod template changes → RollingUpdate. With
+          # maxUnavailable: 0 (deploy/k8s/base/deployment.yaml) + readiness
+          # /-/ping, the handover is invisible behind the LB.
+          checksum="$({ cat conf/config.yaml; printf '%s' "$HTPASSWD_B64"; } | sha256sum | cut -d' ' -f1)"
+          echo "verdaccio.example.com/config-checksum=$checksum"
+
+          kubectl kustomize --load-restrictor LoadRestrictionsNone \
+            deploy/k8s/overlays/cluster-a | kubectl apply --filename=-
+          # (Note: each config change generates a new hashed ConfigMap;
+          #   the previous ones are orphaned — harmless, nothing references
+          #   them after the rollout.)
+
+          patch="$(jq --null-input --compact-output --arg c "$checksum" \
+            '{spec:{template:{metadata:{annotations:{"verdaccio.example.com/config-checksum":$c}}}}}')"
+          kubectl patch deployment vmp-a-verdaccio --type=strategic --patch "$patch"
+
+          kubectl rollout status deployment/vmp-a-verdaccio --timeout=120s
+
+  # IN SERIES, not concurrent: runs ONLY if deploy-a ended healthy (see the
+  # header comment). Logic identical to deploy-a; only the overlay,
+  # deployment (namePrefix vmp-b-) and kubeconfig change.
+  deploy-b:
+    needs: deploy-a
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Cluster B kubeconfig
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG_CLUSTER_B }}
+        run: |
+          mkdir -p "$HOME/.kube"
+          printf '%s' "$KUBE_CONFIG" > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Materialize Secret verdaccio-htpasswd
+        env:
+          HTPASSWD_B64: ${{ secrets.HTPASSWD_B64 }}
+        run: |
+          # The Secret lives OUTSIDE the kustomization (gets no namePrefix) →
+          # it is materialized with EXACTLY the name verdaccio-htpasswd.
+          # Rotation = update the repo secret and re-run this workflow.
+          htpasswd_file="$(mktemp)"
+          trap 'rm -f "$htpasswd_file"' EXIT
+          printf '%s' "$HTPASSWD_B64" | base64 --decode > "$htpasswd_file"
+          if [ ! -s "$htpasswd_file" ]; then
+            echo "::error::HTPASSWD_B64 is empty or not valid base64"
+            exit 1
+          fi
+          kubectl create secret generic verdaccio-htpasswd \
+            --from-file=htpasswd="$htpasswd_file" \
+            --dry-run=client --output=yaml | kubectl apply --filename=-
+
+      - name: Apply overlay + force rollout + wait for health (cluster B)
+        env:
+          HTPASSWD_B64: ${{ secrets.HTPASSWD_B64 }}
+        run: |
+          # Same checksum contract as deploy-a: covers policy changes AND
+          # credential rotation (subPath mounts do not refresh on their
+          # own).
+          checksum="$({ cat conf/config.yaml; printf '%s' "$HTPASSWD_B64"; } | sha256sum | cut -d' ' -f1)"
+          echo "verdaccio.example.com/config-checksum=$checksum"
+
+          kubectl kustomize --load-restrictor LoadRestrictionsNone \
+            deploy/k8s/overlays/cluster-b | kubectl apply --filename=-
+          # (Note: each config change generates a new hashed ConfigMap;
+          #   the previous ones are orphaned — harmless, nothing references
+          #   them after the rollout.)
+
+          patch="$(jq --null-input --compact-output --arg c "$checksum" \
+            '{spec:{template:{metadata:{annotations:{"verdaccio.example.com/config-checksum":$c}}}}}')"
+          kubectl patch deployment vmp-b-verdaccio --type=strategic --patch "$patch"
+
+          kubectl rollout status deployment/vmp-b-verdaccio --timeout=120s
+
+  smoke:
+    needs: deploy-b
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Smoke test against the LB (up to 3 attempts)
+        env:
+          REGISTRY_URL: ${{ vars.LB_URL }}
+          SERVICE_USER: ${{ secrets.SERVICE_USER }}
+          SERVICE_PASS: ${{ secrets.SERVICE_PASS }}
+        run: |
+          # Retries (2 extra, 10 s sleep between attempts) for convergence
+          # after the rollout: endpoint propagation in the LB and the cold
+          # cache of the new pods when requesting the first packument.
+          attempt=1
+          while [ "$attempt" -le 3 ]; do
+            if ./scripts/smoke-test.sh; then
+              echo "smoke OK (attempt $attempt/3)"
+              exit 0
+            fi
+            echo "smoke failed (attempt $attempt/3)"
+            attempt=$((attempt + 1))
+            if [ "$attempt" -le 3 ]; then
+              echo "retrying in 10 s…"
+              sleep 10
+            fi
+          done
+          echo "::error::smoke failed after 3 attempts — triage: README 'Operations' → 'Canary' (step 1); rollback: kubectl rollout undo on the affected cluster"
+          exit 1

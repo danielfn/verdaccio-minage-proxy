@@ -1,0 +1,27 @@
+# Kustomize base for the verdaccio proxy (overlays: cluster-a and cluster-b).
+#
+# The policy lives in conf/config.yaml (repo root — single source of truth,
+# shared with docker compose and the pipeline). Since that file is OUTSIDE
+# deploy/k8s/, the build needs to allow loads outside the overlay root:
+#   kustomize build --load-restrictor LoadRestrictionsNone deploy/k8s/overlays/cluster-a
+#   kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/k8s/overlays/cluster-a
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - deployment.yaml
+  - service.yaml
+  - pvc.yaml
+
+# namespace: verdaccio   # uncomment only if the platform enforces a namespace
+
+configMapGenerator:
+  # The name-suffix hash (default) makes a change in conf/config.yaml
+  # produce a NEW ConfigMap -> the pod template changes -> the Deployment
+  # rolls. The pipeline additionally overwrites the Deployment's
+  # config-checksum annotation (see deployment.yaml).
+  - name: verdaccio-config
+    options:
+      disableNameSuffixHash: false # explicit: the hash is functional (rolling)
+    files:
+      - config.yaml=../../../conf/config.yaml # single source: conf/config.yaml

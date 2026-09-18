@@ -1,0 +1,30 @@
+# ClusterIP Service — the platform LB (TLS, /-/ping healthcheck,
+# CIDR allowlist) sits in front of the Service. The platform decides the
+# concrete exposure; variants are commented per corporate convention.
+apiVersion: v1
+kind: Service
+metadata:
+  name: verdaccio
+  labels:
+    app: verdaccio
+spec:
+  # Default variant (recommended): internal platform LB in front.
+  type: ClusterIP
+  #
+  # Alternatives (uncomment ONLY one, per the cluster convention):
+  #
+  # type: NodePort
+  # ports:
+  #   - name: http
+  #     port: 4873
+  #     targetPort: 4873
+  #     nodePort: 34873 # range 30000-32767
+  #
+  # type: LoadBalancer
+  # (the ports block below stays the same in both variants)
+  selector:
+    app: verdaccio
+  ports:
+    - name: http
+      port: 4873
+      targetPort: 4873

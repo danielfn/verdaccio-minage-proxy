@@ -1,0 +1,13 @@
+# CODEOWNERS — review gates for the GitOps flow (see docs/break-glass.md).
+#
+# ⚠️ PENDING REPLACEMENT: the `@mi-org/...` teams are placeholders.
+# Replace them with the organization's real teams; until they exist,
+# GitHub cannot request their review and the gate is not effective.
+# Syntax: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# The quarantine policy and allow rules only with security review
+/conf/            @mi-org/security-team
+# Deployment changes are gated too (they affect the applied policy)
+/deploy/          @mi-org/security-team @mi-org/platform-team
+# Default: the service team
+*                 @mi-org/platform-team

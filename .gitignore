@@ -1,0 +1,7 @@
+.private
+storage/
+conf/htpasswd
+node_modules/
+package.json
+package-lock.json
+.sdd/

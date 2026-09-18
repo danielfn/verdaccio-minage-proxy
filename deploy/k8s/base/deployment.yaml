@@ -1,0 +1,96 @@
+# Deployment of the verdaccio proxy — 1 replica per cluster (D9: one instance
+# per cluster; caches NEVER shared between instances, C10).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: verdaccio
+  labels:
+    app: verdaccio
+spec:
+  replicas: 1
+  strategy:
+    # Zero-downtime rolling: the old pod keeps serving until the new one
+    # passes readiness (the platform LB gates on /-/ping).
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: verdaccio
+  template:
+    metadata:
+      labels:
+        app: verdaccio
+      annotations:
+        # The deploy pipeline OVERWRITES this value with the
+        # sha256 of conf/config.yaml on every deploy: pods do NOT restart
+        # on their own when the ConfigMap changes, and touching this
+        # annotation forces the rollout of the new config. Only the
+        # placeholder remains here.
+        verdaccio.example.com/config-checksum: placeholder
+    spec:
+      securityContext:
+        # The verdaccio image runs as uid 10001.
+        runAsUser: 10001
+        runAsNonRoot: true
+        fsGroup: 10001 # group-writable PVC for the storage
+      containers:
+        - name: verdaccio
+          # Exact pin — bumping the version is a deliberate PR (the security
+          # policy must not change due to a floating tag).
+          image: verdaccio/verdaccio:6.9.2
+          ports:
+            - name: http
+              containerPort: 4873
+          readinessProbe:
+            # Gates the LB pool during rollouts (zero downtime is validated
+            # by scripts/ha-check.sh — see docs/ha-validation.md).
+            httpGet:
+              path: /-/ping
+              port: 4873
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /-/ping
+              port: 4873
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            # Lean: only metadata/tarballs toward the repo manager.
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: config
+              mountPath: /verdaccio/conf/config.yaml
+              subPath: config.yaml
+              readOnly: true # read-only policy, lives in git
+            - name: htpasswd
+              mountPath: /verdaccio/conf/htpasswd
+              subPath: htpasswd
+              readOnly: true
+              # NOTE: subPath mounts do NOT update on their own when the
+              # Secret changes; the deploy pipeline forces a rollout when
+              # rotating credentials (via the config-checksum annotation or a
+              # rollout restart).
+            - name: storage
+              mountPath: /verdaccio/storage
+      volumes:
+        - name: config
+          configMap:
+            # The generator adds a hash to the name; kustomize resolves the ref.
+            name: verdaccio-config
+        - name: htpasswd
+          secret:
+            # Created OUTSIDE kustomize (runbook in secret.example.yaml);
+            # exactly this name in both clusters (the overlays' namePrefix
+            # does NOT apply to it because it is not a kustomization resource).
+            secretName: verdaccio-htpasswd
+        - name: storage
+          persistentVolumeClaim:
+            claimName: verdaccio-storage

@@ -1,0 +1,18 @@
+# Overlay for cluster A. Difference from cluster-b: ONLY the namePrefix and
+# the cluster label (origin identification in kubectl). The policy
+# (conf/config.yaml, via base) is IDENTICAL in both clusters — architecture
+# consistency #1; any other difference is a bug.
+#
+# Build (see note in base/kustomization.yaml about --load-restrictor):
+#   kustomize build --load-restrictor LoadRestrictionsNone deploy/k8s/overlays/cluster-a
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+namePrefix: vmp-a-
+
+labels:
+  - pairs:
+      cluster: a

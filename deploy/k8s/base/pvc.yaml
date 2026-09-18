@@ -1,0 +1,22 @@
+# PVC for the local cache — DISPENSABLE by design (architecture): if it is
+# lost, each instance re-fetches from npmjs with no functional loss.
+#
+# Lean alternative (volatile cache acceptable): remove this PVC and use
+# `emptyDir: {}` in the Deployment for the 'storage' volume — trade-off: a
+# cold cache after every restart (more fetches to npmjs until warm).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: verdaccio-storage
+  labels:
+    app: verdaccio
+spec:
+  accessModes:
+    # RWO: verdaccio storage does not support multi-instance access;
+    # caches are PER INSTANCE and never shared (C10).
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  # storageClassName: <specific-class>   # uncomment to pin a class;
+  #                                      # commented = inherits the cluster default.

@@ -1,0 +1,68 @@
+# verdaccio-proxy — minimum release age policy in front of the public registry
+#
+# Chain: developers -> cloud repo manager --> THIS VERDACCIO --> registry.npmjs.org
+# Role: proxy with a quarantine for recent versions (supply-chain).
+# Config empirically validated against verdaccio/verdaccio:6.9.2.
+
+storage: /verdaccio/storage/data
+plugins: /verdaccio/plugins
+
+# Lean: machine-to-machine proxy, no UI.
+web:
+  enable: false
+
+# Only local service accounts; self-registration disabled (max_users: -1).
+# The file hot-reloads when modified (verified in PoC) — rotation without
+# restart. It is mounted read-only from conf/htpasswd so that all
+# instances (2 clusters) share credentials from the deployment.
+# IMPORTANT: hashes must be bcrypt ($2a$/$2y$) — the internal verifier
+# (unix-crypt-td-js) does NOT validate SHA512-crypt from `openssl passwd -6`.
+# Generate with: ./scripts/generate-htpasswd.sh <user> <pass> >> conf/htpasswd
+auth:
+  htpasswd:
+    file: /verdaccio/conf/htpasswd
+    max_users: -1
+
+uplinks:
+  npmjs:
+    url: https://registry.npmjs.org/
+
+# Authenticated read-only (the repo manager uses basic auth with the service account).
+# 'publish'/'unpublish' are omitted on purpose: empty list = denied for everyone
+# (allow_action treats an empty list as no permission) -> pure proxy, nobody publishes here.
+packages:
+  '@*/*':
+    access: $authenticated
+    proxy: npmjs
+  '**':
+    access: $authenticated
+    proxy: npmjs
+
+# The policy the repo manager does not provide: a 4-day quarantine for ALL public packages.
+# The plugin (@verdaccio/package-filter, bundled since 6.4.0):
+#  - filters at serve-time; the on-disk cache is left untouched and versions
+#    "age" and show up on their own (no re-publishing or manual refetch needed).
+#  - recalculates dist-tags/latest after filtering and prunes the tarball URLs
+#    (_distfiles) of hidden versions -> the direct tarball of a hidden version
+#    returns 404.
+#  - break-glass exceptions (urgent security patches) via 'allow'.
+filters:
+  '@verdaccio/package-filter':
+    minAgeDays: 4
+    # Break-glass: exempt a specific scope/package/version from ALL rules.
+    # allow:
+    #   - scope: '@mi-org'            # own trusted scopes
+    #   - package: 'esbuild'          # manually verified package
+    #   - package: 'typescript'
+    #     versions: '7.1.0'           # specific exempted version
+
+# npm audit pass-through (for compatibility if the repo manager forwards it;
+# disable with `enabled: false` for an even leaner proxy).
+middlewares:
+  audit:
+    enabled: true
+
+log:
+  type: stdout
+  format: pretty
+  level: http
